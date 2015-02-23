@@ -6,228 +6,293 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <ctype.h>
+#include <errno.h>
 
-#define PLAYER_PIPE_ "in.pipe"
-#define PLAYER_OUTPUT_ "stdout"
-#define RADIO_PLS_DIR_ "/home/pi/hdd/radio/"
+static struct {
+	const char *radio_exe;
+	const char *omxctl_exe;
+} cfg_ = { "./radio.sh",
+		   "./omxctl.sh" };
 
 static struct control_ {
-	const char *name;
-	const char  key;
-} controls_[] = { "stop", 'q',
-                  "vol_up", '=',
-                  "vol_down", '-',
-                  0, 0 };
+	const char *cmd;
+	const char *label;
+} controls_[] = { "stop",       "Stop",
+                  "volu 1",     "Vol +",
+                  "volu 3",     "Vol +++",
+                  "vold 3",     "Vol ---",
+                  "vold 1",     "Vol -" };
+static const size_t controls_n_ = (sizeof (controls_) /
+                                   sizeof (struct control_));
 
+#define _ERR_MSG( format, ... ) printf ("<p><strong>%s [%d]: " format "</strong></p>", \
+                                        __FUNCTION__,  __LINE__, __VA_ARGS__)
 
-void
-_err_msg (const char * msg, ...)
+static char *
+_chomp (char *str)
 {
-	va_list args;
+	char *ptr = str;
 
-	printf ("<p><strong>ERROR: ");
-	va_start (args, msg);
-	vfprintf (stdout, msg, args);
-	va_end (args);
-	puts ("</strong></p>");
-}
-
-static int
-_list_radio_playlists (void)
-{
-	char buf[512];
-	const char cmd[] = "for file in $(ls -1 " RADIO_PLS_DIR_ "*pls); "
-	                   "do basename \"$file\" .pls; done";
-
-	FILE *pipe = popen (cmd, "r");
-	if (pipe)
+	if (ptr)
 	{
-		puts ("<ul>");
-		char *newline;
-		while (fgets (buf, sizeof (buf), pipe))
+		/* move to end of string */
+
+		while (*ptr)
+			++ptr;
+
+		/* move towards start nullifying trailing white space */
+
+		while ((--ptr) > str)
 		{
-			newline = strrchr (buf, (int)'\n');
-			if (newline)
-				*newline = '\0';
-			printf ("<li><a href=\"?%s\">%s</a></li>\n", buf, buf);
+			if (isspace (*ptr))
+				*ptr = '\0';
+			else
+				break;
 		}
-		puts ("</ul>");
-
-		pclose (pipe);
 	}
-	else
-		_err_msg ("failed to open pipe: %s", cmd);
 
-	return 0;
+	return ptr;
 }
 
-static int
-_player_running ()
+static char *
+_get_file_contents (const char *path, unsigned int *size)
 {
-	if (! system ("pgrep omxplayer 2>&1 > /dev/null"))
-		return 1;
-	else
+	struct stat fstats;
+	int fd = -1;
+	char *fcontents = NULL;
+
+	if (! path)
+	{
+		_ERR_MSG("NULL path", 0);
+		return NULL;
+	}
+
+	fd = open (path, O_RDONLY);
+	if (fd == -1)
+	{
+		_ERR_MSG("open %s", path);
+		goto error;
+	}
+
+	if (fstat (fd, &fstats) == -1)
+	{
+		_ERR_MSG("stat fd %d", fd);
+		goto error;
+	}
+
+	fcontents = calloc (sizeof (char), fstats.st_size + 1);
+	if (! fcontents)
+	{
+		_ERR_MSG("calloc %u", fstats.st_size);
+		goto error;
+	}
+
+	if (read (fd, fcontents, fstats.st_size) != fstats.st_size)
+	{
+		_ERR_MSG("read %u bytes", fstats.st_size);
+		goto error;
+	}
+
+	if (size)
+		*size = fstats.st_size;
+
+cleanup:
+	close (fd);
+
+	return fcontents;
+
+error:
+	free (fcontents);
+	fcontents = NULL;
+	goto cleanup;
+}
+
+
+static int
+_print_radio_playlists (void)
+{
+	int fsize = 0;
+	char *fcontents = _get_file_contents ("stations.basename", &fsize);
+
+	if (! fcontents)
 		return 0;
-}
 
-static int
-_process_player_output (void)
-{
-	FILE *fp = fopen (PLAYER_OUTPUT_, "r");
-	const char *grep_vol = "Current Volume: ";
-	const size_t grep_vol_len = strlen (grep_vol);
-	char buffer[512];
-	char volume[10];
-	char *vol = NULL, *vol_end = NULL, *point = NULL;
+	char *eof = fcontents + fsize;
+	char *line = fcontents;
+	char *line_end = NULL;
 
-	if (! fp)
-		return 0;
-
-	while (fgets (buffer, sizeof (buffer), fp))
+	puts ("<ul id=\"stations\">");
+	while (line < eof)
 	{
-		if (! strncmp (grep_vol, buffer, grep_vol_len))
-		{
-			vol = buffer + grep_vol_len;
-			vol_end = strchr (vol, 'd');
-			if (! vol_end)
-				continue;
+		line_end = strchr (line, '\n');
+		if (line_end)
+			*line_end = '\0';
 
-			*vol_end = '\0';
+		printf ("<li><a href=\"?%s\">%s</a></li>\n", line, line);
 
-			point = strchr (vol, '.');
-			if (point)
-				strcpy (point, point+1);
-			
-			strncpy (volume, vol, sizeof (volume));
-			volume[sizeof (volume) -1] = '\0';
-		}
+		line = line_end + 1;
 	}
+	puts ("</ul>");
 
-	fclose (fp);
-
-	if (vol)
-	{
-		fp = fopen ("volume", "w");
-		if (fp)
-		{
-			fputs (volume, fp); 
-			fclose (fp);
-		}
-	}
+	free (fcontents);
 
 	return 1;
 }
 
 static int
-_send_to_player (const char cmd)
+_send_to_player (const char *args)
 {
-	int pipe = -1;
-	int retry;	
-	
-	for (retry = 10; pipe == -1 && retry; --retry)
-		pipe = open ("in.pipe", O_WRONLY | O_NONBLOCK);
+	char *cmd = NULL;
+	int ret = 0;
 
-	if (pipe == -1)
+	if (! args)
+		return 0;
+
+	if (asprintf (&cmd, "%s %s 2>&1 > /dev/null", cfg_.omxctl_exe, args) > 0)
 	{
-		_err_msg ("failed to open player pipe"); 
+		if (system (cmd) == 0)
+			ret = 1;
+
+		free (cmd);
+	}
+
+	return ret;
+}
+
+static int
+_is_control_index (const char *str)
+{
+	unsigned long index = 0;
+	char *nan = NULL;
+
+	if (str)
+	{
+		index = strtoul (str, &nan, 10);
+		if (nan != str && *nan == '\0')
+		{
+			if (index < controls_n_)
+				return index;
+		}
+	}
+
+	return -1;
+}
+
+static int
+_process_post_controls (void)
+{
+	const char ctl_spec[] = "control=";
+	char buf[sizeof (ctl_spec) + 1 + 1 + 1];
+	int ctl_index;
+
+	if (! fgets (buf, sizeof (buf), stdin))
+	{
+		if (ferror (stdin))
+		{
+			_ERR_MSG( "%s", strerror (errno));
+			return -1;
+		}
+
 		return 0;
 	}
 
-	if (cmd)
-		write (pipe, &cmd, sizeof (cmd));
+	_chomp (buf);
 
-	if (cmd == 'q')
+	if (strncmp (buf, ctl_spec, sizeof (ctl_spec) - 1))
 	{
-		while (_player_running ())
-		{
-			write (pipe, "qqqqqqqqqq", 10);
-			fsync (pipe);
-			sleep (1);
-		}
-		_process_player_output ();
+		_ERR_MSG("not a control: %s", buf);
+		return -1;
 	}
 
-	close (pipe);
+	ctl_index = _is_control_index (buf + sizeof (ctl_spec) - 1);
+
+	if (ctl_index == -1)
+	{
+		_ERR_MSG("no control found: %s", buf);
+		return -1;
+	}
+
+	if (! _send_to_player (controls_[ctl_index].cmd))
+		return -1;
 
 	return 1;
 }
+
 
 static int
 _process_query_string (void)
 {
-	int player_running = _player_running ();
 	const char *query_string = getenv ("QUERY_STRING");
+	char *cmd;
+	int ret = 0;
 
-	if (! query_string) 
+	if (! query_string || ! *query_string)
 		return 0;
-	
-	/* if query_string contains a commmand, carry it out */
 
-	struct control_ *ctl = controls_;
-	for (; ctl->name; ctl++)
+	if (0 < asprintf (&cmd, "%s \"%s\" 2>&1 > /dev/null",
+					  cfg_.radio_exe, query_string))
 	{
-		if (! strcmp (ctl->name, query_string))
-		{
-			if (player_running) 
-				_send_to_player (ctl->key); 
+		if (system (cmd))
+			_ERR_MSG("Failed: %s", cmd);
+		else
+			ret = 1;
 
-			ctl = NULL;
-			break; 
-		}
-	}	
-	if (ctl)
-	{
-		/* no command was found. assume query_string to be
-		 * criteria for which station to listen to
-		 */
-		if (player_running)
-			_send_to_player ('q');
-
-		char cmd[1024];
-		snprintf (cmd, sizeof (cmd),
-				  "/usr/local/bin/fl-radio.sh \"%s\""
-				  " --vol \"$(cat volume)\" < " PLAYER_PIPE_
-				  " 2> stderr 1> " PLAYER_OUTPUT_ 
-				  " & echo > " PLAYER_PIPE_,
-				  query_string);
-		system (cmd);
+		free (cmd);
 	}
+	else
+		_ERR_MSG("asprintf", 0);
 
-	return 1;
+	return ret;
 }
 
 static int
 _print_controls (void)
 {
-	const struct control_ *ctl = controls_;
-	
-	puts ("<ul>");
+	int i;
 
-	for (; ctl->name; ctl++)
-		printf ("<li><a href=\"?%s\">%s</a></li>\n", ctl->name, ctl->name);
+	puts ("<ul id=\"controls\">"
+	      "<form method=\"post\" action=\"\">");
 
-	puts ("</ul>");
+	for (i = 0; i < controls_n_; i++)
+		printf ("<li>"
+		        "<button name=\"control\" type=\"submit\" value=\"%u\">%s</button>"
+		        "</li>\n",
+		        i, controls_[i].label);
+
+	puts ("</form>"
+	      "</ul>");
 
 	return 1;
 }
-	
+
 int
 main (int argc, char *argv[])
 {
-	puts ("Content-type: text/html\n\n" 
+	puts ("Content-type: text/html\n\n"
+	      "<!DOCTYPE html>\n"
 		  "<html>\n"
 	      "<head>\n"
 		  "<link rel=\"stylesheet\" type=\"text/css\" href=\"radio.css\">\n"
 		  "<title>RPi: Radio</title>\n"
 		  "</head>\n\n"
 		  "<body>\n"
+		  "<article>\n"
 		  "<h1>RPi: Radio</h1>");
 
-	_process_query_string (); 
-	_print_controls ();
-	_list_radio_playlists ();
+    /* process any posted controls. if none were sent, process query string
+     * for station
+     */
+	if (! _process_post_controls ())
+		_process_query_string ();
 
-	puts ("</body>\n</html>");
+	puts ("<h2>Controls</h2>\n");
+	_print_controls ();
+
+	puts ("<h2>Stations</h2>\n");
+	_print_radio_playlists ();
+
+	puts ("</article></body>\n</html>");
 
 	return EXIT_SUCCESS;
 }

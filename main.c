@@ -266,6 +266,22 @@ _print_controls (void)
 	return 1;
 }
 
+static int
+_print_info (void)
+{
+	char *recent_stn = _get_file_contents ("station_recent", NULL);
+	char *volume     = _get_file_contents ("volume", NULL);
+
+	if (_chomp (recent_stn))
+		printf ("<p>Last played: <a href=\"?%s\">%s</a></p>\n",
+		        recent_stn, recent_stn);
+
+	if (_chomp (volume))
+		printf ("<p>Volume: %s</p>\n", volume);
+
+	return 1;
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -285,6 +301,8 @@ main (int argc, char *argv[])
      */
 	if (! _process_post_controls ())
 		_process_query_string ();
+
+	_print_info ();
 
 	puts ("<h2>Controls</h2>\n");
 	_print_controls ();

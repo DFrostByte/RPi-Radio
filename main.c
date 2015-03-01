@@ -251,8 +251,8 @@ _print_controls (void)
 {
 	int i;
 
-	puts ("<ul id=\"controls\">"
-	      "<form method=\"post\" action=\"\">");
+	puts ("<form method=\"post\" action=\"\">\n"
+	      "<ul id=\"controls\">\n");
 
 	for (i = 0; i < controls_n_; i++)
 		printf ("<li>"
@@ -260,8 +260,8 @@ _print_controls (void)
 		        "</li>\n",
 		        i, controls_[i].label);
 
-	puts ("</form>"
-	      "</ul>");
+	puts ("</ul>\n"
+	      "</form>");
 
 	return 1;
 }

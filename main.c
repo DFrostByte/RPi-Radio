@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,17 +14,20 @@
 static struct {
 	const char *radio_exe;
 	const char *omxctl_exe;
-} cfg_ = { "./radio.sh",
-		   "./omxctl.sh" };
+	const char *pls_dir;
+} cfg_ = { "./radio-test.sh",
+		   "./omxctl.sh",
+		   "/srv/ftp/radio" };
 
 static struct control_ {
 	const char *cmd;
+	const char *arg;
 	const char *label;
-} controls_[] = { "stop",       "Stop",
-                  "volu 1",     "Vol +",
-                  "volu 3",     "Vol +++",
-                  "vold 3",     "Vol ---",
-                  "vold 1",     "Vol -" };
+} controls_[] = { "stop",	NULL,  	"Stop",
+                  "volu",	"1",	"Vol +",
+                  "volu",	"3",   	"Vol +++",
+                  "vold",	"3",  	"Vol ---",
+                  "vold",	"1",   	"Vol -" };
 static const size_t controls_n_ = (sizeof (controls_) /
                                    sizeof (struct control_));
 
@@ -43,7 +48,7 @@ _chomp (char *str)
 
 		/* move towards start nullifying trailing white space */
 
-		while ((--ptr) > str)
+		while (! (--ptr < str))
 		{
 			if (isspace (*ptr))
 				*ptr = '\0';
@@ -81,10 +86,10 @@ _get_file_contents (const char *path, unsigned int *size)
 		goto error;
 	}
 
-	fcontents = calloc (sizeof (char), fstats.st_size + 1);
+	fcontents = malloc (fstats.st_size + 1);
 	if (! fcontents)
 	{
-		_ERR_MSG("calloc %u", fstats.st_size);
+		_ERR_MSG("malloc %u", fstats.st_size);
 		goto error;
 	}
 
@@ -93,6 +98,7 @@ _get_file_contents (const char *path, unsigned int *size)
 		_ERR_MSG("read %u bytes", fstats.st_size);
 		goto error;
 	}
+	fcontents[fstats.st_size] = 0;
 
 	if (size)
 		*size = fstats.st_size;
@@ -141,23 +147,32 @@ _print_radio_playlists (void)
 }
 
 static int
-_send_to_player (const char *args)
+_send_to_player (const char *command, const char *arg)
 {
-	char *cmd = NULL;
-	int ret = 0;
-
-	if (! args)
+	if (! command || ! *command)
 		return 0;
 
-	if (asprintf (&cmd, "%s %s 2>&1 > /dev/null", cfg_.omxctl_exe, args) > 0)
-	{
-		if (system (cmd) == 0)
-			ret = 1;
+	pid_t pid;
+	int exit_status;
 
-		free (cmd);
+	pid = fork();
+	if (pid == -1)
+		return 0;
+	else if (pid == 0)
+	{
+		execl(cfg_.omxctl_exe, cfg_.omxctl_exe, command, arg, NULL);
+		exit(EXIT_FAILURE);
 	}
 
-	return ret;
+	waitpid(pid, &exit_status, 0);
+
+	if (exit_status)
+	{
+		_ERR_MSG("execl() failed: %s %s %s", cfg_.omxctl_exe, command, arg);
+		return 0;
+	}
+
+	return 1;
 }
 
 static int
@@ -213,35 +228,103 @@ _process_post_controls (void)
 		return -1;
 	}
 
-	if (! _send_to_player (controls_[ctl_index].cmd))
+	if (! _send_to_player (controls_[ctl_index].cmd, controls_[ctl_index].arg))
 		return -1;
 
 	return 1;
 }
 
+static char *
+_pls_path_from_basename(const char *fname)
+{
+	char *path;
+
+	if (! asprintf (&path, "%s/%s.pls", cfg_.pls_dir, basename(fname)) > 0)
+	{
+		_ERR_MSG("asprintf", 0);
+		path = NULL;
+	}
+
+	return path;
+}
+
+static int
+_save_last_played(const char *basename)
+{
+	FILE *fp = fopen("station_recent", "w");
+	int ret = 0;
+
+	if (fp)
+	{
+		if (fputs(basename, fp) != EOF)
+			ret = 1;
+
+		fclose(fp);
+	}
+
+	return ret;
+}
+
+static char *
+_url_from_pls(const char *pls)
+{
+	if (! pls || ! *pls)
+		return 0;
+
+	char *contents = NULL;
+	char *url = NULL;
+
+	if (contents = _get_file_contents(pls, NULL))
+	{
+		/* urls are contained on lines =~ "File\d+=.*\n" */
+		if (url = strcasestr(contents, "file"))
+		{
+			char *url_end;
+
+			url_end = strchrnul(url, '\n');
+			*url_end = 0;
+			url = strchrnul(url, '=');
+			++url;
+
+			if (url_end > url)
+				url = strdup(url);
+			else
+				url = NULL;
+		}
+	}
+
+	free(contents);
+
+	return url;
+}
 
 static int
 _process_query_string (void)
 {
 	const char *query_string = getenv ("QUERY_STRING");
-	char *cmd;
+	char *pls_path = NULL;
+	char *url = NULL;
 	int ret = 0;
 
 	if (! query_string || ! *query_string)
 		return 0;
 
-	if (0 < asprintf (&cmd, "%s \"%s\" 2>&1 > /dev/null",
-					  cfg_.radio_exe, query_string))
+	if ((pls_path = _pls_path_from_basename(query_string)) &&
+		(url = _url_from_pls(pls_path)))
 	{
-		if (system (cmd))
-			_ERR_MSG("Failed: %s", cmd);
-		else
+		if (_send_to_player("play", url))
+		{
+			_save_last_played(query_string);
 			ret = 1;
-
-		free (cmd);
+		}
 	}
-	else
-		_ERR_MSG("asprintf", 0);
+
+	if (! ret)
+		_ERR_MSG("URL from '%s'", pls_path);
+
+cleanup:
+	free(pls_path);
+	free(url);
 
 	return ret;
 }
@@ -251,8 +334,8 @@ _print_controls (void)
 {
 	int i;
 
-	puts ("<form method=\"post\" action=\"\">\n"
-	      "<ul id=\"controls\">\n");
+	puts ("<ul id=\"controls\">\n"
+	      "<form method=\"post\" action=\"\">");
 
 	for (i = 0; i < controls_n_; i++)
 		printf ("<li>"
@@ -260,8 +343,8 @@ _print_controls (void)
 		        "</li>\n",
 		        i, controls_[i].label);
 
-	puts ("</ul>\n"
-	      "</form>");
+	puts ("</form>\n"
+	      "</ul>");
 
 	return 1;
 }
@@ -285,7 +368,7 @@ _print_info (void)
 int
 main (int argc, char *argv[])
 {
-	puts ("Content-type: text/html\n\n"
+	puts ("Content-type: text/html\r\n\r\n"
 	      "<!DOCTYPE html>\n"
 		  "<html>\n"
 	      "<head>\n"
@@ -304,13 +387,13 @@ main (int argc, char *argv[])
 
 	_print_info ();
 
-	puts ("<h2>Controls</h2>\n");
+	puts ("<h2>Controls</h2>");
 	_print_controls ();
 
-	puts ("<h2>Stations</h2>\n");
+	puts ("<h2>Stations</h2>");
 	_print_radio_playlists ();
 
-	puts ("</article></body>\n</html>");
+	puts ("</article>\n</body>\n</html>");
 
 	return EXIT_SUCCESS;
 }

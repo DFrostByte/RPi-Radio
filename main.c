@@ -16,7 +16,7 @@ static struct {
 	const char *omxctl_exe;
 	const char *pls_dir;
 } cfg_ = { "./radio-test.sh",
-		   "./omxctl.sh",
+		   "./omxctl",
 		   "/srv/ftp/radio" };
 
 static struct control_ {
@@ -160,7 +160,10 @@ _send_to_player (const char *command, const char *arg)
 		return 0;
 	else if (pid == 0)
 	{
+		stdin = stdout = stderr = NULL;
+
 		execl(cfg_.omxctl_exe, cfg_.omxctl_exe, command, arg, NULL);
+
 		exit(EXIT_FAILURE);
 	}
 
